@@ -1,0 +1,187 @@
+# CI/CD & Infrastructure Design – banking-finance Service
+
+**Project:** banking-finance (Spring Boot)
+**Author:** Vikrant
+**Repo:** https://github.com/vikrant246/banking-finance
+**Date:** May 2025
+
+---
+
+## Overview
+
+This document covers the CI/CD pipeline design and infrastructure decisions I made for the `banking-finance` Spring Boot service. The goal was to keep things practical — automated deployments, no accidental pushes to production, and a setup that can actually scale without becoming expensive on day one.
+
+The service is deployed on AWS EKS using Jenkins as the CI/CD engine. Docker images are stored in ECR. Every branch maps to a specific environment, and the pipeline handles building, testing, and deploying automatically.
+
+---
+
+## Part 1 – CI/CD Pipeline Design
+
+### 1.1 Branching Strategy
+
+I went with a straightforward three-branch model. Nothing overly complex — just something that maps cleanly to three environments.
+
+```
+feature/* or develop  →  qa         (dev testing)
+staging               →  staging    (pre-prod validation)
+main                  →  prod       (live users)
+```
+
+**How it works in practice:**
+
+When a developer is building something new, they work on a `feature/` branch. That branch auto-deploys to the `qa` namespace on every push — so the team can always see what's in progress. Once the feature is done, it gets merged into `develop` (also goes to qa), then a PR is raised to `staging`, and finally another PR from `staging` to `main` for production.
+
+The reason I kept `develop` going to qa and not a separate dev environment is purely cost. For a project at this stage, running four environments would be wasteful. QA and dev can share a namespace.
+
+**Avoiding accidental prod deployments:**
+
+Three things protect production:
+
+1. `main` branch is protected on GitHub — no one can push to it directly. You have to raise a PR and get it approved.
+2. The Jenkins pipeline has a manual `input` gate before any production deploy. Even if a merge happens, a human still has to click "Yes, Deploy to Production" in Jenkins before anything goes out.
+3. The `main` branch in GitHub has a required reviewer set — so at minimum one other person has to approve the PR.
+
+These three together mean production can only change intentionally.
+
+---
+
+### 1.2 Jenkins Pipeline
+
+The pipeline has 8 stages. I kept each stage focused on one thing so it's easy to see exactly where something failed.
+
+```
+Stage 1 → Set Environment       (branch name → namespace)
+Stage 2 → Checkout              (pull code from GitHub)
+Stage 3 → Run Tests             (mvn test — stops here if any test fails)
+Stage 4 → Build JAR             (mvn package)
+Stage 5 → Build Docker Image    (docker build)
+Stage 6 → Push to ECR           (push image to AWS ECR)
+Stage 7 → Deploy to EKS         (kubectl apply → rollout)
+Stage 8 → Health Check          (hit /actuator/health, rollback if down)
+```
+
+**On a PR (not merged yet):**
+Jenkins only runs stages 1–4. It builds and tests, but does not deploy. This gives developers fast feedback without touching any environment.
+
+**On merge:**
+All 8 stages run. For production merges, stage 7 pauses and waits for manual approval.
+
+**Rollback strategy:**
+If the health check in stage 8 fails, the `post { failure }` block automatically runs `kubectl rollout undo`. This reverts to the previous deployment within about 30 seconds. I also use build numbers as image tags (not `latest`) so every image is traceable and any version can be re-deployed manually if needed.
+
+---
+
+### 1.3 Configuration Management
+
+Environment-specific config is handled through Kubernetes environment variables injected at deploy time — not baked into the Docker image. The image itself is environment-agnostic. The `APP_ENV` variable tells Spring Boot which profile to activate.
+
+```
+qa namespace      →  APP_ENV=qa      →  spring.profiles.active=qa
+staging namespace →  APP_ENV=staging →  spring.profiles.active=staging
+prod namespace    →  APP_ENV=prod    →  spring.profiles.active=prod
+```
+
+For secrets (API keys, DB credentials etc.), I use AWS Secrets Manager. The application retrieves them at startup via the AWS SDK — nothing sensitive goes into the repo or into Kubernetes YAML files.
+
+The Jenkins server itself uses an IAM Role attached to the EC2 instance. No hardcoded AWS credentials anywhere — Jenkins gets temporary credentials automatically from the instance metadata service.
+
+---
+
+### 1.4 Deployment Strategy
+
+**I chose Rolling Deployment.**
+
+Here is why I didn't pick the others:
+
+- **Recreate** kills all pods before starting new ones. That means downtime. Not acceptable.
+- **Blue/Green** runs two full copies of the environment simultaneously. Great for zero-risk cutover but doubles your infrastructure cost. Not justified at this stage.
+- **Rolling** replaces pods one at a time. The old version keeps serving traffic until the new pod is healthy. Zero downtime, no extra cost.
+
+The rolling config I used:
+```yaml
+maxSurge: 1        # one extra pod spun up during update
+maxUnavailable: 0  # never kill old pod until new one passes readiness probe
+```
+
+Combined with the readiness probe on `/actuator/health`, Kubernetes will never route traffic to a pod that hasn't finished starting up. If a pod fails its readiness check, the rollout stops and the old version keeps running.
+
+---
+
+## Part 2 – Infrastructure Design
+
+### 2.1 Compute Choice – Why EKS
+
+I evaluated three options:
+
+| Option | Pros | Cons | Decision |
+|--------|------|------|----------|
+| EC2 only | Simple, full control | Manual scaling, no self-healing | ✗ |
+| ECS | Easier than EKS, AWS-native | Less flexible, harder to migrate later | ✗ |
+| EKS | Standard Kubernetes, auto-scaling, self-healing | More setup upfront | ✓ |
+
+I went with EKS because the team is already familiar with Kubernetes concepts, and it gives us horizontal pod autoscaling out of the box. If load spikes, new pods spin up automatically. If a pod crashes, Kubernetes restarts it. EC2 can't do either of those things on its own.
+
+Node type is `t3.medium` — 2 vCPU, 4 GB RAM. Enough for a Spring Boot app in development and staging. Production can scale the node group up if needed.
+
+---
+
+### 2.2 Container Registry – ECR
+
+ECR was the natural choice since everything else is on AWS. No cross-cloud authentication complexity. IAM roles handle access — no passwords to manage. Images are private by default and tag immutability can be turned on to prevent overwriting released versions.
+
+---
+
+### 2.3 Networking
+
+```
+Internet
+    ↓
+AWS Load Balancer  (created automatically by K8s Service type: LoadBalancer)
+    ↓
+EKS Worker Nodes  (inside VPC, private subnets)
+    ↓
+Pods (banking-finance containers)
+```
+
+The pods themselves are not directly exposed to the internet. The Kubernetes Service of type `LoadBalancer` provisions an AWS Network Load Balancer which is the only public-facing entry point. This keeps the attack surface small.
+
+For a production hardening step, I'd move to an ALB Ingress Controller and add a WAF rule in front of it — but for this phase, the NLB approach is sufficient.
+
+---
+
+### 2.4 Secrets & IAM
+
+No passwords in code. No passwords in environment variables baked into images.
+
+The setup:
+- Jenkins EC2 has an **IAM Role** attached → gets temporary credentials automatically
+- That role has permissions for ECR (push images) and EKS (deploy)
+- Application secrets live in **AWS Secrets Manager**
+- Pods retrieve secrets at runtime via the AWS SDK
+
+This way there is nothing sensitive in the Git repository, nothing sensitive in the Dockerfile, and nothing sensitive in the Kubernetes YAML files.
+
+---
+
+### 2.5 Logging & Monitoring
+
+- **CloudWatch Container Insights** is enabled on the EKS cluster — this gives CPU, memory, and pod-level metrics out of the box with no extra setup.
+- **Application logs** go to stdout from the Spring Boot app and are automatically collected by CloudWatch Logs via the Fluent Bit daemonset that EKS installs by default.
+- For alerting, CloudWatch Alarms are set on pod restart count and CPU utilization.
+
+This is intentionally lightweight. The priority was getting deployments working reliably. A proper observability stack (Prometheus + Grafana) is the next step once the pipeline is stable.
+
+---
+
+## Key Decisions Summary
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| CI/CD tool | Jenkins | Already running, team familiar |
+| Container registry | AWS ECR | Same AWS account, IAM auth |
+| Compute | AWS EKS | Auto-scaling, self-healing |
+| Deployment type | Rolling | Zero downtime, no extra cost |
+| Secrets | AWS Secrets Manager | Nothing sensitive in code |
+| Credentials | IAM Role on EC2 | No hardcoded keys |
+| Prod protection | Branch protection + manual gate | Two-layer safety |
+| Image tagging | Build number | Every build traceable |
