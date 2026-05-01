@@ -1,0 +1,64 @@
+# banking-finance
+
+Spring Boot banking service with full CI/CD pipeline on AWS EKS.
+
+## Repo structure
+
+```
+banking-finance/
+├── src/                        ← Spring Boot application (existing)
+├── k8s/
+│   └── deployment.yaml         ← Kubernetes deployment + service
+├── docs/
+│   └── design-document.md      ← CI/CD and infrastructure design write-up
+├── Dockerfile                  ← existing
+├── Jenkinsfile                 ← CI/CD pipeline definition
+└── README.md
+```
+
+## Branch → Environment
+
+| Branch | Environment | Approval needed? |
+|--------|-------------|-----------------|
+| `feature/*` | qa | No |
+| `develop` | qa | No |
+| `staging` | staging | No |
+| `main` | prod | Yes — manual gate in Jenkins |
+
+## Pipeline stages
+
+1. Set environment (reads branch name)
+2. Checkout code from GitHub
+3. Run unit tests — stops if any test fails
+4. Build JAR with Maven
+5. Build Docker image
+6. Push image to AWS ECR (ap-south-1)
+7. Deploy to EKS namespace
+8. Health check — auto-rollback if it fails
+
+## Infrastructure
+
+- **Compute:** AWS EKS (ap-south-1) — `banking-cluster`
+- **Registry:** AWS ECR — `banking-finance`
+- **CI/CD:** Jenkins on EC2 Ubuntu
+- **Deployment type:** Rolling (zero downtime)
+- **Credentials:** IAM Role on Jenkins EC2 — no hardcoded keys
+
+## Quick commands
+
+```bash
+# Check pods in any environment
+kubectl get pods -n qa
+kubectl get pods -n staging
+kubectl get pods -n prod
+
+# Get the app URL
+kubectl get svc banking-finance -n qa
+
+# Manual rollback
+kubectl rollout undo deployment/banking-finance -n qa
+```
+
+## Design document
+
+Full explanation of all decisions: [docs/design-document.md](docs/design-document.md)
